@@ -412,7 +412,48 @@ impl DatabentoFeedHandler {
             let merged = coalesce_subscribes(buffered_subs);
             if n_buffered != merged.len() {
                 log::info!(
-                    "Coalesced {n_buffered} buffered subscribes into {} subscription(s)",
+                    "Coalesced {n_buffered} reconnect-buffered subscribes into {} subscription(s)",
+                    merged.len()
+                );
+            }
+            self.subscriptions.extend(merged);
+        }
+
+        // Drain any commands that were already queued on `cmd_rx` while the
+        // gateway connect handshake was in flight. The strategies' `on_start`
+        // storms typically deliver thousands of single-symbol subscribes in
+        // milliseconds, all of which pile up here. Coalescing them by
+        // (schema, stype_in, use_snapshot, start) turns O(N) WS subscribe
+        // round-trips into O(N/500) thanks to the chunker in
+        // `databento::live::protocol::subscribe`.
+        let mut pre_session_subs: Vec<Subscription> = Vec::new();
+        loop {
+            match self.cmd_rx.try_recv() {
+                Ok(HandlerCommand::Subscribe(sub)) => {
+                    if !self.replay && sub.start.is_some() {
+                        self.replay = true;
+                    }
+                    pre_session_subs.push(sub);
+                }
+                Ok(HandlerCommand::SetPricePrecision(symbol, precision)) => {
+                    self.price_precision_overrides.insert(symbol, precision);
+                }
+                Ok(HandlerCommand::Start) => {
+                    start_buffered = true;
+                }
+                Ok(HandlerCommand::Close) => {
+                    log::warn!("Close received during pre-session drain, shutting down");
+                    return Ok(false);
+                }
+                Err(_) => break,
+            }
+        }
+        if !pre_session_subs.is_empty() {
+            let n_pre = pre_session_subs.len();
+            let merged = coalesce_subscribes(pre_session_subs);
+            if n_pre != merged.len() {
+                log::info!(
+                    "Coalesced {n_pre} pre-session subscribes into {} subscription(s)",
                     merged.len()
                 );
             }
