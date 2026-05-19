@@ -1803,10 +1803,17 @@ impl Cache {
             database.add_quote(&quote)?;
         }
 
+        let cap = self.config.tick_capacity;
         let quotes_deque = self
             .quotes
             .entry(quote.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(cap));
+        // Enforce the documented "maximum length" semantics. `VecDeque::with_capacity`
+        // is only an initial-allocation hint; without this loop the deque grows
+        // unbounded under sustained streaming and OOMs the host.
+        while quotes_deque.len() >= cap {
+            quotes_deque.pop_back();
+        }
         quotes_deque.push_front(quote);
         Ok(())
     }
@@ -1830,12 +1837,17 @@ impl Cache {
             }
         }
 
+        let cap = self.config.tick_capacity;
         let quotes_deque = self
             .quotes
             .entry(instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(cap));
 
         for quote in quotes {
+            // See add_quote: enforce the max length on every push.
+            while quotes_deque.len() >= cap {
+                quotes_deque.pop_back();
+            }
             quotes_deque.push_front(*quote);
         }
         Ok(())
@@ -1855,10 +1867,15 @@ impl Cache {
             database.add_trade(&trade)?;
         }
 
+        let cap = self.config.tick_capacity;
         let trades_deque = self
             .trades
             .entry(trade.instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(cap));
+        // See add_quote: `with_capacity` is initial alloc, not a cap.
+        while trades_deque.len() >= cap {
+            trades_deque.pop_back();
+        }
         trades_deque.push_front(trade);
         Ok(())
     }
@@ -1882,12 +1899,16 @@ impl Cache {
             }
         }
 
+        let cap = self.config.tick_capacity;
         let trades_deque = self
             .trades
             .entry(instrument_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(cap));
 
         for trade in trades {
+            while trades_deque.len() >= cap {
+                trades_deque.pop_back();
+            }
             trades_deque.push_front(*trade);
         }
         Ok(())
