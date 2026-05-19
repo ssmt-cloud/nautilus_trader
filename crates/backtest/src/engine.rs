@@ -452,6 +452,114 @@ impl BacktestEngine {
         Ok(())
     }
 
+    /// Adds market data backed by a shared `Arc<Vec<Data>>` for replay.
+    ///
+    /// Lets the same data buffer back many `BacktestEngine` instances (one per
+    /// parallel sweep worker) without deep-copying the bars on each call —
+    /// cloning the `Arc` only bumps the ref-count. Without this, an SSMT sweep
+    /// with N workers over a 25-60 GB catalog OOMs at ~N × bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `data` is empty.
+    /// - `sort` is `true` — we cannot mutate data behind a shared `Arc` without
+    ///   breaking sharing, so the caller must pre-sort by `ts_init` ascending.
+    ///   Use [`Self::add_data`] if you need the engine to sort for you.
+    /// - `validate` is `true` and the instrument for the first element has not
+    ///   been added to the cache via [`add_instrument`](Self::add_instrument).
+    /// - `validate` is `true` and the first element is a [`Data::Bar`] whose
+    ///   `aggregation_source` is not [`AggregationSource::External`].
+    pub fn add_data_shared(
+        &mut self,
+        data: Arc<Vec<Data>>,
+        _client_id: Option<ClientId>,
+        validate: bool,
+        sort: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!data.is_empty(), "data was empty");
+        anyhow::ensure!(
+            !sort,
+            "add_data_shared cannot sort data behind a shared Arc; pre-sort by ts_init \
+             before wrapping in Arc, or use add_data() if you need engine-side sorting"
+        );
+
+        let count = data.len();
+
+        if validate {
+            // Mirror Cython: validate against the first element only and assume the
+            // batch is homogeneous (documented contract on add_data).
+            let first = &data[0];
+            let first_instrument_id = first.instrument_id();
+            anyhow::ensure!(
+                self.kernel
+                    .cache
+                    .borrow()
+                    .instrument(&first_instrument_id)
+                    .is_some(),
+                "Instrument {first_instrument_id} for the given data not found in the cache. \
+                 Add the instrument through `add_instrument()` prior to adding related data."
+            );
+
+            if let Data::Bar(bar) = first {
+                anyhow::ensure!(
+                    bar.bar_type.aggregation_source() == AggregationSource::External,
+                    "bar_type.aggregation_source must be External, was {:?}",
+                    bar.bar_type.aggregation_source(),
+                );
+            }
+        }
+
+        // Same has_data / has_book_data / ts-bound tracking as `add_data`. We
+        // iterate by reference because the Arc is shared — we cannot consume it.
+        let mut batch_min_ts: Option<UnixNanos> = None;
+        let mut batch_max_ts: Option<UnixNanos> = None;
+
+        for item in data.iter() {
+            let instr_id = item.instrument_id();
+            self.has_data.insert(instr_id);
+
+            if item.is_order_book_data() {
+                self.has_book_data.insert(instr_id);
+            }
+
+            self.add_market_data_client_if_not_exists(instr_id.venue);
+
+            let ts = item.ts_init();
+            batch_min_ts = Some(batch_min_ts.map_or(ts, |cur| cur.min(ts)));
+            batch_max_ts = Some(batch_max_ts.map_or(ts, |cur| cur.max(ts)));
+        }
+
+        if let Some(ts) = batch_min_ts
+            && self.ts_first.is_none_or(|t| ts < t)
+        {
+            self.ts_first = Some(ts);
+        }
+
+        if let Some(ts) = batch_max_ts
+            && self.ts_last_data.is_none_or(|t| ts > t)
+        {
+            self.ts_last_data = Some(ts);
+        }
+
+        self.data_len += count;
+        let stream_name = format!("backtest_data_{}", self.data_stream_counter);
+        self.data_stream_counter += 1;
+        self.data_iterator
+            .add_data_shared(&stream_name, data, true);
+
+        // Caller has asserted pre-sorted by passing sort=false (the only allowed value).
+        self.sorted = true;
+
+        log::info!(
+            "Added {count} shared data element{} to BacktestEngine ({} total)",
+            if count == 1 { "" } else { "s" },
+            self.data_len,
+        );
+
+        Ok(())
+    }
+
     /// Adds a strategy to the backtest engine.
     ///
     /// # Errors
@@ -1648,5 +1756,42 @@ mod tests {
             .unwrap()
             .market_status;
         assert_eq!(market_status, MarketStatus::Closed);
+    }
+
+    #[rstest]
+    fn test_add_data_shared_rejects_sort_true(crypto_perpetual_ethusdt: CryptoPerpetual) {
+        // Sorting requires mutating the inner `Vec<Data>`, which is impossible while
+        // it is shared across iterators via `Arc`. The engine must refuse `sort=true`
+        // loudly so callers don't silently get unsorted data (or an implicit clone).
+        use std::sync::Arc;
+
+        use nautilus_model::{
+            data::QuoteTick,
+            types::{Price, Quantity},
+        };
+
+        let mut engine = create_engine();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        engine.add_instrument(&instrument).unwrap();
+
+        let inst_id = instrument.id();
+        let quote = Data::Quote(QuoteTick::new(
+            inst_id,
+            Price::from("1.0"),
+            Price::from("1.0"),
+            Quantity::from(100),
+            Quantity::from(100),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ));
+        let data = Arc::new(vec![quote]);
+
+        let err = engine
+            .add_data_shared(data, None, false, true)
+            .expect_err("sort=true must be rejected — cannot sort behind shared Arc");
+        assert!(
+            err.to_string().contains("cannot sort"),
+            "expected sort-rejection error, got: {err}"
+        );
     }
 }
