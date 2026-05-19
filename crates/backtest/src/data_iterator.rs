@@ -15,7 +15,7 @@
 
 //! Multi-stream, time-ordered data iterator for replaying historical data.
 
-use std::collections::BinaryHeap;
+use std::{collections::BinaryHeap, sync::Arc};
 
 use ahash::AHashMap;
 use nautilus_core::UnixNanos;
@@ -86,12 +86,17 @@ impl PartialOrd for HeapEntry {
 }
 
 /// Multi-stream, time-ordered data iterator used by the backtest engine.
+///
+/// Streams are stored as `Arc<Vec<Data>>` so the same data buffer can back many
+/// iterators (one per parallel backtest worker) without cloning the underlying
+/// bars — see [`Self::add_data_shared`]. The legacy [`Self::add_data`] API still
+/// takes an owned `Vec<Data>` and internally wraps it in an `Arc`.
 #[derive(Debug, Default)]
 pub struct BacktestDataIterator {
-    streams: AHashMap<i32, Vec<Data>>, // key: priority, value: Vec<Data>
-    names: AHashMap<i32, String>,      // priority -> name
-    priorities: AHashMap<String, i32>, // name -> priority
-    indices: AHashMap<i32, usize>,     // cursor per stream
+    streams: AHashMap<i32, Arc<Vec<Data>>>, // key: priority, value: shared stream buffer
+    names: AHashMap<i32, String>,           // priority -> name
+    priorities: AHashMap<String, i32>,      // name -> priority
+    indices: AHashMap<i32, usize>,          // cursor per stream
     heap: BinaryHeap<HeapEntry>,
     single_priority: Option<i32>,
     next_priority_counter: i32, // monotonically increasing counter used to assign priorities
@@ -112,7 +117,13 @@ impl BacktestDataIterator {
         }
     }
 
-    /// Adds (or replaces) a named data stream.
+    /// Adds (or replaces) a named data stream from an owned `Vec<Data>`.
+    ///
+    /// Convenience wrapper around [`Self::add_data_shared`] that sorts the vec
+    /// by `ts_init` in place and wraps the result in a fresh `Arc`. Use
+    /// [`Self::add_data_shared`] directly when the caller already holds an
+    /// `Arc<Vec<Data>>` they want to share across multiple iterators (parallel
+    /// backtest workers) without cloning the data.
     ///
     /// When `append_data` is true the stream gets lower priority on timestamp
     /// ties; when false (prepend) it wins ties.
@@ -121,12 +132,38 @@ impl BacktestDataIterator {
             return;
         }
 
+        // Sort here so callers of the legacy API don't have to. `add_data_shared`
+        // requires the data already sorted (we cannot sort through an `Arc`).
         data.sort_by_key(replay_key);
+        self.add_data_shared(name, Arc::new(data), append_data);
+    }
+
+    /// Adds (or replaces) a named data stream backed by a shared `Arc<Vec<Data>>`.
+    ///
+    /// Lets the same data buffer back many iterators (e.g. N parallel backtest
+    /// workers each running their own `BacktestEngine` over the same catalog)
+    /// without deep-copying the bars — only the `Arc` ref-count is bumped.
+    ///
+    /// # Requirements
+    ///
+    /// The caller MUST pre-sort `data` by replay order (`ts_init` ascending for
+    /// non-DeFi data). Sorting is the reason [`Self::add_data`] takes ownership
+    /// of a `Vec<Data>`; once the data is behind a shared `Arc` we cannot mutate
+    /// it without breaking sharing.
+    pub fn add_data_shared(
+        &mut self,
+        name: &str,
+        data: Arc<Vec<Data>>,
+        append_data: bool,
+    ) {
+        if data.is_empty() {
+            return;
+        }
 
         self.add_stream(name, data, append_data);
     }
 
-    fn add_stream(&mut self, name: &str, data: Vec<Data>, append_data: bool) {
+    fn add_stream(&mut self, name: &str, data: Arc<Vec<Data>>, append_data: bool) {
         let priority = if let Some(p) = self.priorities.get(name) {
             // Replace existing stream – remove previous traces then re-insert below.
             *p
@@ -187,7 +224,9 @@ impl BacktestDataIterator {
     pub(crate) fn next_item(&mut self) -> Option<Data> {
         // Fast path for single stream
         if let Some(p) = self.single_priority {
-            let data = self.streams.get_mut(&p)?;
+            // Immutable `get` on streams — `Arc<Vec<Data>>` is shared, the
+            // per-iterator cursor is in `self.indices`.
+            let data = self.streams.get(&p)?;
             let idx = self.indices.get_mut(&p)?;
             if *idx >= data.len() {
                 return None;
@@ -262,6 +301,8 @@ impl BacktestDataIterator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use nautilus_model::{
         data::QuoteTick,
         identifiers::InstrumentId,
@@ -625,6 +666,28 @@ mod tests {
             InstrumentId::from("E.F"),
             "Prepend stream should always come first in ties"
         );
+    }
+
+    #[rstest]
+    fn test_add_data_shared_does_not_clone_underlying_vec() {
+        // Proves that `add_data_shared` shares the same `Vec<Data>` across multiple
+        // iterators via `Arc`, rather than deep-copying it. This is the property the
+        // SSMT parallel sweep needs to avoid OOMing on N copies of a 25-60 GB catalog.
+        let arc: Arc<Vec<Data>> =
+            Arc::new(vec![quote("A.B", 100), quote("A.B", 200), quote("A.B", 300)]);
+
+        let mut it1 = BacktestDataIterator::new();
+        let mut it2 = BacktestDataIterator::new();
+        it1.add_data_shared("s", arc.clone(), true);
+        it2.add_data_shared("s", arc.clone(), true);
+
+        // One strong ref held by the test + one per iterator. If the iterator deep-copied
+        // (e.g. by `(*arc).clone()`) the count would stay at 1.
+        assert_eq!(Arc::strong_count(&arc), 3);
+
+        // Both iterators must replay the full stream independently.
+        assert_eq!(collect_ts(&mut it1), vec![100, 200, 300]);
+        assert_eq!(collect_ts(&mut it2), vec![100, 200, 300]);
     }
 
     #[rstest]
