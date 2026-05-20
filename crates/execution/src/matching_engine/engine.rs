@@ -1494,11 +1494,20 @@ impl OrderMatchingEngine {
     }
 
     fn process_trade_ticks_from_bar(&mut self, bar: &Bar) {
-        // Split the bar into 4 trades, adding remainder to close trade
-        let quarter_raw = bar.volume.raw / 4;
-        let remainder_raw = bar.volume.raw % 4;
-        let size = Quantity::from_raw(quarter_raw, bar.volume.precision);
-        let close_size = Quantity::from_raw(quarter_raw + remainder_raw, bar.volume.precision);
+        // Split the bar into 4 trades, adding remainder to close trade. The split is
+        // performed at the instrument's size-precision step so every synthetic tick's
+        // raw value is a multiple of that step (otherwise bar.volume.raw / 4 can land
+        // between precision steps and downstream normalize_fill_quantity rejects the
+        // fill — see "Skipping fill" warning).
+        let size_precision = self.instrument.size_precision();
+        let scale =
+            QuantityRaw::pow(10, u32::from(FIXED_PRECISION.saturating_sub(size_precision)));
+        let volume_units = bar.volume.raw / scale;
+        let quarter_units = volume_units / 4;
+        let remainder_units = volume_units % 4;
+        let size = Quantity::from_raw(quarter_units * scale, size_precision);
+        let close_size =
+            Quantity::from_raw((quarter_units + remainder_units) * scale, size_precision);
 
         let aggressor_side = if self.core.last.is_none_or(|last| bar.open > last) {
             AggressorSide::Buyer
@@ -1606,7 +1615,7 @@ impl OrderMatchingEngine {
         }
     }
 
-    fn process_quote_ticks_from_bar(&mut self, bar: &Bar) {
+    fn process_quote_ticks_from_bar(&mut self, _bar: &Bar) {
         // Wait for next bar
         if self.last_bar_bid.is_none()
             || self.last_bar_ask.is_none()
@@ -1617,16 +1626,30 @@ impl OrderMatchingEngine {
         let bid_bar = self.last_bar_bid.unwrap();
         let ask_bar = self.last_bar_ask.unwrap();
 
-        // Split bar volume into 4, adding remainder to close quote
-        let bid_quarter = bid_bar.volume.raw / 4;
-        let bid_remainder = bid_bar.volume.raw % 4;
-        let ask_quarter = ask_bar.volume.raw / 4;
-        let ask_remainder = ask_bar.volume.raw % 4;
+        // Split bar volume into 4, adding remainder to close quote. The split is
+        // performed at the instrument's size-precision step so every synthetic tick's
+        // raw value is a multiple of that step (see process_trade_ticks_from_bar for
+        // the rationale).
+        let size_precision = self.instrument.size_precision();
+        let scale =
+            QuantityRaw::pow(10, u32::from(FIXED_PRECISION.saturating_sub(size_precision)));
+        let bid_units = bid_bar.volume.raw / scale;
+        let bid_quarter_units = bid_units / 4;
+        let bid_remainder_units = bid_units % 4;
+        let ask_units = ask_bar.volume.raw / scale;
+        let ask_quarter_units = ask_units / 4;
+        let ask_remainder_units = ask_units % 4;
 
-        let bid_size = Quantity::from_raw(bid_quarter, bar.volume.precision);
-        let ask_size = Quantity::from_raw(ask_quarter, bar.volume.precision);
-        let bid_close_size = Quantity::from_raw(bid_quarter + bid_remainder, bar.volume.precision);
-        let ask_close_size = Quantity::from_raw(ask_quarter + ask_remainder, bar.volume.precision);
+        let bid_size = Quantity::from_raw(bid_quarter_units * scale, size_precision);
+        let ask_size = Quantity::from_raw(ask_quarter_units * scale, size_precision);
+        let bid_close_size = Quantity::from_raw(
+            (bid_quarter_units + bid_remainder_units) * scale,
+            size_precision,
+        );
+        let ask_close_size = Quantity::from_raw(
+            (ask_quarter_units + ask_remainder_units) * scale,
+            size_precision,
+        );
 
         // Create reusable quote tick
         let mut quote_tick = QuoteTick::new(
