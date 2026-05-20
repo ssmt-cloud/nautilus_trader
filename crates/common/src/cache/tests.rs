@@ -5344,6 +5344,97 @@ fn test_add_bars_same_timestamp_adds_all(mut cache: Cache) {
     );
 }
 
+/// Regression test for the `bar_capacity` contract: `CacheConfig::bar_capacity`
+/// is documented as "The maximum length for internal bar deques", but the
+/// pre-patch implementation only used it as a `VecDeque::with_capacity` hint
+/// — every `add_bar` / `add_bars` call grew the deque unboundedly. At sweep
+/// scale (1-SEC bars × 100 tickers × 63 days) this OOM'd the AWS Batch host
+/// at ~40 GB per worker. Mirrors the existing tick-capacity enforcement in
+/// `add_quote` / `add_trade`.
+#[rstest]
+fn test_add_bar_enforces_bar_capacity() {
+    let cap = 3usize;
+    let config = CacheConfig::builder().bar_capacity(cap).build();
+    let mut cache = Cache::new(Some(config), None);
+
+    let bar_type = BarType::from("AUDUSD.SIM-1-MINUTE-BID-EXTERNAL");
+
+    // Push 10 bars one at a time; deque must never exceed `bar_capacity`.
+    for i in 0..10u64 {
+        let ts = UnixNanos::from(1000 + i);
+        let bar = Bar::new(
+            bar_type,
+            Price::from("1.00000"),
+            Price::from("1.00001"),
+            Price::from("0.99999"),
+            Price::from("1.00000"),
+            Quantity::from(100_000),
+            ts,
+            ts,
+        );
+        cache.add_bar(bar).unwrap();
+        let len = cache.bars(&bar_type).map(|b| b.len()).unwrap_or(0);
+        assert!(
+            len <= cap,
+            "bar deque grew past bar_capacity (len={len}, cap={cap}) after push {i}"
+        );
+    }
+
+    // After 10 pushes the deque must be at the cap, holding the LATEST bars
+    // (push_front + pop_back semantics → newest at index 0, oldest evicted).
+    let result = cache.bars(&bar_type).unwrap();
+    assert_eq!(result.len(), cap, "final deque len should equal cap");
+    assert_eq!(
+        result[0].ts_init,
+        UnixNanos::from(1009),
+        "most recent push must be at deque front"
+    );
+}
+
+/// Regression test for the bulk `add_bars` path. Pre-patch this used
+/// `tick_capacity` for the initial allocation (copy-paste from `add_quotes`)
+/// AND skipped the per-push cap check — so the bulk path was uncapped even
+/// after the per-element `add_bar` path was fixed.
+#[rstest]
+fn test_add_bars_enforces_bar_capacity() {
+    let cap = 3usize;
+    let config = CacheConfig::builder().bar_capacity(cap).build();
+    let mut cache = Cache::new(Some(config), None);
+
+    let bar_type = BarType::from("AUDUSD.SIM-1-MINUTE-BID-EXTERNAL");
+    let bars: Vec<Bar> = (0..10u64)
+        .map(|i| {
+            let ts = UnixNanos::from(1000 + i);
+            Bar::new(
+                bar_type,
+                Price::from("1.00000"),
+                Price::from("1.00001"),
+                Price::from("0.99999"),
+                Price::from("1.00000"),
+                Quantity::from(100_000),
+                ts,
+                ts,
+            )
+        })
+        .collect();
+
+    cache.add_bars(&bars).unwrap();
+
+    let result = cache.bars(&bar_type).unwrap();
+    assert_eq!(
+        result.len(),
+        cap,
+        "bulk add_bars must respect bar_capacity (got {} > {})",
+        result.len(),
+        cap
+    );
+    assert_eq!(
+        result[0].ts_init,
+        UnixNanos::from(1009),
+        "most recent bulk-inserted bar must be at deque front"
+    );
+}
+
 // -- orders_emulated index tests ------------------------------------------------------------------
 
 #[rstest]
