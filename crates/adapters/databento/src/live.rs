@@ -68,6 +68,47 @@ pub enum HandlerCommand {
     Close,
 }
 
+/// Coalesce single-symbol `Subscription`s by `(schema, stype_in, use_snapshot, start)`
+/// into multi-symbol subscriptions.
+///
+/// When many actors each push their own single-symbol subscribe at session
+/// start, this turns O(N) WS round-trips into O(N / 500) — the upstream chunker
+/// in `databento::live::protocol::subscribe` splits a Vec<String> at 500 symbols
+/// per SubRequest. Subscriptions whose symbol set is `Symbols::All` or
+/// `Symbols::Ids` pass through unchanged because merging would change their
+/// gateway semantics.
+fn coalesce_subscribes(subs: Vec<Subscription>) -> Vec<Subscription> {
+    use std::collections::HashMap;
+    type Key = (dbn::Schema, dbn::SType, bool, Option<i128>);
+    let mut grouped: HashMap<Key, (Subscription, Vec<String>)> = HashMap::new();
+    let mut passthrough: Vec<Subscription> = Vec::new();
+    for sub in subs {
+        match &sub.symbols {
+            databento::Symbols::Symbols(syms) => {
+                let key: Key = (
+                    sub.schema,
+                    sub.stype_in,
+                    sub.use_snapshot,
+                    sub.start.map(|t| t.unix_timestamp_nanos()),
+                );
+                let entry = grouped
+                    .entry(key)
+                    .or_insert_with(|| (sub.clone(), Vec::new()));
+                entry.1.extend(syms.iter().cloned());
+            }
+            _ => passthrough.push(sub),
+        }
+    }
+    let mut out = passthrough;
+    out.reserve(grouped.len());
+    for (_, (template, symbols)) in grouped {
+        let mut merged = template;
+        merged.symbols = databento::Symbols::Symbols(symbols);
+        out.push(merged);
+    }
+    out
+}
+
 #[derive(Debug)]
 pub enum DatabentoMessage {
     Data(Data),
@@ -342,13 +383,18 @@ impl DatabentoFeedHandler {
                 self.buffered_commands.len()
             );
 
+            // Collect Subscribes separately so we can coalesce them by
+            // (schema, stype_in, use_snapshot, start) before pushing into
+            // `self.subscriptions`. Drain proceeds in order so SetPricePrecision
+            // / Start / Close still apply with their original semantics.
+            let mut buffered_subs: Vec<Subscription> = Vec::new();
             for cmd in self.buffered_commands.drain(..) {
                 match cmd {
                     HandlerCommand::Subscribe(sub) => {
                         if !self.replay && sub.start.is_some() {
                             self.replay = true;
                         }
-                        self.subscriptions.push(sub);
+                        buffered_subs.push(sub);
                     }
                     HandlerCommand::SetPricePrecision(symbol, precision) => {
                         self.price_precision_overrides.insert(symbol, precision);
@@ -362,6 +408,56 @@ impl DatabentoFeedHandler {
                     }
                 }
             }
+            let n_buffered = buffered_subs.len();
+            let merged = coalesce_subscribes(buffered_subs);
+            if n_buffered != merged.len() {
+                log::info!(
+                    "Coalesced {n_buffered} reconnect-buffered subscribes into {} subscription(s)",
+                    merged.len()
+                );
+            }
+            self.subscriptions.extend(merged);
+        }
+
+        // Drain any commands that were already queued on `cmd_rx` while the
+        // gateway connect handshake was in flight. The strategies' `on_start`
+        // storms typically deliver thousands of single-symbol subscribes in
+        // milliseconds, all of which pile up here. Coalescing them by
+        // (schema, stype_in, use_snapshot, start) turns O(N) WS subscribe
+        // round-trips into O(N/500) thanks to the chunker in
+        // `databento::live::protocol::subscribe`.
+        let mut pre_session_subs: Vec<Subscription> = Vec::new();
+        loop {
+            match self.cmd_rx.try_recv() {
+                Ok(HandlerCommand::Subscribe(sub)) => {
+                    if !self.replay && sub.start.is_some() {
+                        self.replay = true;
+                    }
+                    pre_session_subs.push(sub);
+                }
+                Ok(HandlerCommand::SetPricePrecision(symbol, precision)) => {
+                    self.price_precision_overrides.insert(symbol, precision);
+                }
+                Ok(HandlerCommand::Start) => {
+                    start_buffered = true;
+                }
+                Ok(HandlerCommand::Close) => {
+                    log::warn!("Close received during pre-session drain, shutting down");
+                    return Ok(false);
+                }
+                Err(_) => break,
+            }
+        }
+        if !pre_session_subs.is_empty() {
+            let n_pre = pre_session_subs.len();
+            let merged = coalesce_subscribes(pre_session_subs);
+            if n_pre != merged.len() {
+                log::info!(
+                    "Coalesced {n_pre} pre-session subscribes into {} subscription(s)",
+                    merged.len()
+                );
+            }
+            self.subscriptions.extend(merged);
         }
 
         let mut running = false;
@@ -1314,6 +1410,72 @@ mod tests {
         assert_eq!(result.unwrap().instrument_id, id_a);
         assert!(buffered.contains_key(&id_b));
         assert!(!buffered.contains_key(&id_a));
+    }
+
+    // -------------------------------------------------------------------------
+    // coalesce_subscribes
+    // -------------------------------------------------------------------------
+
+    fn make_sub(symbol: &str, schema: databento::dbn::Schema) -> Subscription {
+        Subscription::builder().symbols(symbol).schema(schema).build()
+    }
+
+    #[rstest]
+    fn coalesce_merges_single_symbol_subs_by_schema() {
+        let mut subs = Vec::new();
+        for s in &["AAPL", "MSFT", "GOOG", "AMZN", "META"] {
+            subs.push(make_sub(s, databento::dbn::Schema::Mbp1));
+            subs.push(make_sub(s, databento::dbn::Schema::Trades));
+        }
+        let merged = coalesce_subscribes(subs);
+        assert_eq!(merged.len(), 2, "expected one Subscription per schema, got {merged:?}");
+        for sub in &merged {
+            match &sub.symbols {
+                databento::Symbols::Symbols(v) => assert_eq!(v.len(), 5),
+                other => panic!("unexpected symbols variant: {other:?}"),
+            }
+        }
+    }
+
+    #[rstest]
+    fn coalesce_keeps_replay_anchors_separate() {
+        let anchor_a = datetime!(2024-01-01 00:00:00 UTC);
+        let anchor_b = datetime!(2024-01-02 00:00:00 UTC);
+        let s1 = Subscription::builder()
+            .symbols("AAPL")
+            .schema(databento::dbn::Schema::Mbp1)
+            .start(anchor_a)
+            .build();
+        let s2 = Subscription::builder()
+            .symbols("MSFT")
+            .schema(databento::dbn::Schema::Mbp1)
+            .start(anchor_b)
+            .build();
+        let s3 = Subscription::builder()
+            .symbols("GOOG")
+            .schema(databento::dbn::Schema::Mbp1)
+            .start(anchor_a)
+            .build();
+        let merged = coalesce_subscribes(vec![s1, s2, s3]);
+        // Two anchor buckets: { anchor_a: [AAPL, GOOG], anchor_b: [MSFT] }
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[rstest]
+    fn coalesce_passes_through_all_symbols_sentinel() {
+        let all = Subscription::builder()
+            .symbols(databento::Symbols::All)
+            .schema(databento::dbn::Schema::Trades)
+            .build();
+        let merged = coalesce_subscribes(vec![all.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0].symbols, databento::Symbols::All));
+    }
+
+    #[rstest]
+    fn coalesce_handles_empty_input() {
+        let merged = coalesce_subscribes(Vec::new());
+        assert!(merged.is_empty());
     }
 
     mod property_tests {
