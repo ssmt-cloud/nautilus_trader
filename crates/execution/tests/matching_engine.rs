@@ -10243,6 +10243,86 @@ fn test_process_bar_drops_precision_mismatch_after_instrument_update(
     assert!(engine.get_core().last.is_none());
 }
 
+#[rstest]
+fn test_process_bar_fills_limit_when_quartered_volume_not_aligned_to_size_precision(
+    instrument_eth_usdt: InstrumentAny,
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+) {
+    // Regression: bar.volume passes the entry-level check_size_precision guard
+    // when bar.volume.precision == instrument.size_precision, but the synthetic
+    // trade-tick split (bar.volume.raw / 4) can produce a Quantity whose raw
+    // value is NOT a multiple of the instrument's precision step. Downstream,
+    // normalize_fill_quantity then rejects the fill quantity with a "Skipping
+    // fill" warning and the fill is silently dropped.
+    //
+    // Concretely, with instrument size_precision = 0 and bar.volume = 7, the
+    // quarter raw is volume.raw / 4 (1.75 units at the instrument's precision),
+    // which fails quantity_matches_precision(_, 0).
+    let instrument = crypto_perpetual_with_size_precision(instrument_eth_usdt, 0, "1");
+
+    let mut engine =
+        get_order_matching_engine(instrument.clone(), None, None, None, None);
+
+    let bar_type = BarType::from("ETHUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL");
+    let init_bar = Bar {
+        bar_type,
+        open: Price::from("1500.00"),
+        high: Price::from("1500.00"),
+        low: Price::from("1500.00"),
+        close: Price::from("1500.00"),
+        volume: Quantity::from(8), // precision 0, raw is a multiple of (4 * scale)
+        ts_event: UnixNanos::from(1_000_000_000),
+        ts_init: UnixNanos::from(1_000_000_000),
+    };
+    engine.process_bar(&init_bar);
+
+    let limit_price = Price::from("1480.00");
+    let client_order_id = ClientOrderId::from("O-19700101-000000-001-001-1");
+    let mut limit_order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .price(limit_price)
+        .quantity(Quantity::from(1000)) // large enough that per-tick available_qty wins min(...)
+        .client_order_id(client_order_id)
+        .submit(true)
+        .build();
+    engine.process_order(&mut limit_order, account_id);
+    clear_order_event_handler_messages(&order_event_handler);
+
+    // Sweep bar: bar.low crosses the limit price. volume = 7 is precision-aligned
+    // (matches size_precision = 0) but NOT divisible by 4 at the instrument step,
+    // exposing the construction-site bug.
+    let sweep_bar = Bar {
+        bar_type,
+        open: Price::from("1500.00"),
+        high: Price::from("1500.00"),
+        low: Price::from("1470.00"),
+        close: Price::from("1480.00"),
+        volume: Quantity::from(7),
+        ts_event: UnixNanos::from(2_000_000_000),
+        ts_init: UnixNanos::from(2_000_000_000),
+    };
+    engine.process_bar(&sweep_bar);
+
+    let messages = get_order_event_handler_messages(&order_event_handler);
+    let fill = messages
+        .iter()
+        .find_map(|e| match e {
+            OrderEventAny::Filled(f) => Some(f),
+            _ => None,
+        })
+        .expect(
+            "Expected limit fill — synthetic trade size must be aligned to the \
+             instrument's size_precision step so apply_fills accepts it",
+        );
+
+    assert_eq!(
+        fill.last_qty.precision, 0,
+        "last_qty should carry instrument.size_precision"
+    );
+}
+
 fn option_contract(
     underlying: &str,
     venue: &str,
