@@ -1907,10 +1907,19 @@ impl Cache {
             database.add_bar(&bar)?;
         }
 
+        let cap = self.config.bar_capacity;
         let bars = self
             .bars
             .entry(bar.bar_type)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.bar_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(cap));
+        // Enforce the documented "maximum length for internal bar deques" semantics
+        // (see `CacheConfig::bar_capacity`). `VecDeque::with_capacity` is only an
+        // initial-allocation hint; without this loop the deque grows unbounded
+        // under sustained streaming and OOMs the host. Mirrors the existing
+        // `add_quote` / `add_trade` enforcement immediately above.
+        while bars.len() >= cap {
+            bars.pop_back();
+        }
         bars.push_front(bar);
         Ok(())
     }
@@ -1934,12 +1943,23 @@ impl Cache {
             }
         }
 
+        // Previously used `tick_capacity` for the initial allocation — copy-paste
+        // bug from the matching add_quotes code (the bars deque is keyed by
+        // BarType, not by tick / instrument, and should honour the `bar_capacity`
+        // contract not the tick one).
+        let cap = self.config.bar_capacity;
         let bars_deque = self
             .bars
             .entry(bar_type)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.tick_capacity));
+            .or_insert_with(|| VecDeque::with_capacity(cap));
 
         for bar in bars {
+            // See `add_bar`: `with_capacity` is initial alloc, not a cap. Enforce
+            // the documented maximum on every push so streaming workloads stay
+            // bounded.
+            while bars_deque.len() >= cap {
+                bars_deque.pop_back();
+            }
             bars_deque.push_front(*bar);
         }
         Ok(())
