@@ -1520,6 +1520,14 @@ impl OrderMatchingEngine {
         let volume_units = bar.volume.raw / scale;
         let quarter_units = volume_units / 4;
         let remainder_units = volume_units % 4;
+        // Skip bars whose volume is too small to split into 4 positive-sized
+        // quarter ticks. `Quantity::from_raw(0, ...)` would feed `TradeTick::new`
+        // a zero size and panic. Affects illiquid small-caps on 1-second bars
+        // where bar.volume.raw < 4 * scale (e.g. raw volume < 4 shares at
+        // size_precision=0).
+        if quarter_units == 0 {
+            return;
+        }
         let size = Quantity::from_raw(quarter_units * scale, size_precision);
         let close_size =
             Quantity::from_raw((quarter_units + remainder_units) * scale, size_precision);
