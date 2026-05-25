@@ -2422,6 +2422,208 @@ fn test_reset_run_produces_same_results(crypto_perpetual_ethusdt: CryptoPerpetua
     assert_eq!(result1_iterations, 3);
 }
 
+// Bar-driven counterpart to `test_reset_run_produces_same_results`. Bars with
+// `PriceType::Last`/`Mid` flow through `OrderMatchingEngine::process_bar` ->
+// `process_trade_ticks_from_bar`, which dirties matching-engine state that
+// must survive reset. A prior `is_last_initialized` flag desync in
+// `MatchingCore::reset` could leave the engine wedged across runs; this
+// guards against any regression along that same axis.
+#[rstest]
+fn test_reset_run_with_bars_produces_same_results(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let bar_type = BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Second, PriceType::Last),
+        AggregationSource::External,
+    );
+    let bars: Vec<Data> = (1..=5u64)
+        .map(|i| {
+            let base = 1000.0 + i as f64;
+            Data::Bar(Bar::new(
+                bar_type,
+                Price::new(base, 2),
+                Price::new(base + 1.0, 2),
+                Price::new(base - 1.0, 2),
+                Price::new(base + 0.5, 2),
+                Quantity::from("10.000"),
+                UnixNanos::from(i * 1_000_000_000),
+                UnixNanos::from(i * 1_000_000_000),
+            ))
+        })
+        .collect();
+    engine.add_data(bars, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+    let result1_iterations = engine.get_result().iterations;
+    let result1_orders = engine.get_result().total_orders;
+
+    engine.reset();
+    engine.run(None, None, None, false).unwrap();
+    let result2_iterations = engine.get_result().iterations;
+    let result2_orders = engine.get_result().total_orders;
+
+    assert_eq!(result1_iterations, result2_iterations);
+    assert_eq!(result1_orders, result2_orders);
+    assert_eq!(result1_iterations, 5);
+}
+
+// Order-placing companion to `test_reset_run_with_bars_produces_same_results`.
+// Mirrors the SSMT sweep-trial usage pattern: bars feed `process_bar` ->
+// `process_trade_ticks_from_bar`; the strategy submits a market order on the
+// first bar; the synthetic trade tick fills it; the matching engine now holds
+// dirty `last_*` state from the fill. A reset must clear that state cleanly
+// so the next trial produces identical results.
+struct BarMarketOrderStrategy {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    bar_type: BarType,
+    trade_size: Quantity,
+    submitted: bool,
+}
+
+impl BarMarketOrderStrategy {
+    // `order_id_tag` is a constructor arg because `engine.reset()` does not
+    // free tags registered by prior runs; re-adding a strategy with the same
+    // tag in the next run trips the engine's uniqueness check.
+    fn new(
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        trade_size: Quantity,
+        order_id_tag: &str,
+    ) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from(
+                format!("BAR-MKT-{order_id_tag}").as_str(),
+            )),
+            order_id_tag: Some(order_id_tag.to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            bar_type,
+            trade_size,
+            submitted: false,
+        }
+    }
+}
+
+nautilus_strategy!(BarMarketOrderStrategy);
+
+impl Debug for BarMarketOrderStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BarMarketOrderStrategy)).finish()
+    }
+}
+
+impl DataActor for BarMarketOrderStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_bars(self.bar_type, None, None);
+        Ok(())
+    }
+
+    fn on_bar(&mut self, _bar: &Bar) -> anyhow::Result<()> {
+        if !self.submitted {
+            self.submitted = true;
+            let order = self.core.order_factory().market(
+                self.instrument_id,
+                OrderSide::Buy,
+                self.trade_size,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            self.submit_order(order, None, None, None)?;
+        }
+        Ok(())
+    }
+}
+
+#[rstest]
+fn test_reset_run_with_bars_and_market_order_produces_same_results(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let bar_type = BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Second, PriceType::Last),
+        AggregationSource::External,
+    );
+    let bars: Vec<Data> = (1..=5u64)
+        .map(|i| {
+            let base = 1000.0 + i as f64;
+            Data::Bar(Bar::new(
+                bar_type,
+                Price::new(base, 2),
+                Price::new(base + 1.0, 2),
+                Price::new(base - 1.0, 2),
+                Price::new(base + 0.5, 2),
+                Quantity::from("10.000"),
+                UnixNanos::from(i * 1_000_000_000),
+                UnixNanos::from(i * 1_000_000_000),
+            ))
+        })
+        .collect();
+    let trade_size = Quantity::from("0.100");
+
+    engine
+        .add_strategy(BarMarketOrderStrategy::new(
+            instrument_id,
+            bar_type,
+            trade_size,
+            "001",
+        ))
+        .unwrap();
+    engine.add_data(bars.clone(), None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+    let result1_iterations = engine.get_result().iterations;
+    let result1_orders = engine.get_result().total_orders;
+    let result1_positions = engine.get_result().total_positions;
+
+    engine.reset();
+    // Data is preserved across reset (see `test_reset_preserves_data`); we
+    // re-add the strategy with a fresh order_id_tag so its `submitted` flag
+    // starts at false and a new market order fires on the next first bar.
+    engine
+        .add_strategy(BarMarketOrderStrategy::new(
+            instrument_id,
+            bar_type,
+            trade_size,
+            "002",
+        ))
+        .unwrap();
+    engine.run(None, None, None, false).unwrap();
+    let result2_iterations = engine.get_result().iterations;
+    let result2_orders = engine.get_result().total_orders;
+    let result2_positions = engine.get_result().total_positions;
+
+    assert_eq!(result1_iterations, result2_iterations);
+    assert_eq!(result1_orders, result2_orders);
+    assert_eq!(result1_positions, result2_positions);
+    assert_eq!(result1_iterations, 5);
+    assert!(
+        result1_orders >= 1,
+        "strategy should have submitted at least one market order"
+    );
+    assert!(
+        result1_positions >= 1,
+        "market order should have filled and opened a position"
+    );
+}
+
 #[rstest]
 fn test_start_boundary_skips_earlier_data(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let mut engine = create_engine();
