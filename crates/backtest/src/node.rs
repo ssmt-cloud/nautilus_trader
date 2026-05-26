@@ -414,6 +414,15 @@ fn run_streaming(
         // merged QueryResult (a KMerge over all DataFusion batch streams)
         // and chunk-stream it. Memory stays bounded; we do not materialize
         // per-type Vec<Data> the way the eager fallback below does.
+        //
+        // We use `stream_chunks_resort` rather than `stream_chunks` because
+        // the heterogeneous-data-type KMerge can yield items slightly out
+        // of order at batch boundaries — per-stream batches are individually
+        // sorted by DataFusion ORDER BY, but cross-batch arrival order in
+        // the async EagerStream pipeline is not strictly monotonic when
+        // batches for one data type race against batches for another.
+        // Re-sorting per chunk is O(chunk_size log chunk_size) which is
+        // negligible vs the cost of the engine processing the chunk.
         let mut catalog = create_catalog(&data_configs[0])?;
         catalog.reset_session();
         for data_config in data_configs {
@@ -425,7 +434,7 @@ fn run_streaming(
             )?;
         }
         let merged = catalog.session.get_query_result();
-        stream_chunks(engine, config, merged.peekable(), chunk_size)?;
+        stream_chunks_resort(engine, config, merged.peekable(), chunk_size)?;
     } else {
         // Distinct catalog backends across configs (different protocol /
         // storage options): DataFusion registers object stores per-session
@@ -495,6 +504,53 @@ fn dispatch_register_query(
         NautilusDataType::InstrumentClose => catalog
             .register_query::<InstrumentClose>(identifiers, start, end, filter, None, optimize),
     }
+}
+
+// Multi-config variant of `stream_chunks` that re-sorts each chunk by
+// `ts_init` before computing the boundary end timestamp. Required for the
+// streaming multi-data-config path where the upstream KMerge may yield
+// items slightly out of order across heterogeneous DataFusion batch
+// streams.
+fn stream_chunks_resort<I: Iterator<Item = Data>>(
+    engine: &mut BacktestEngine,
+    config: &BacktestRunConfig,
+    mut iter: Peekable<I>,
+    chunk_size: usize,
+) -> anyhow::Result<()> {
+    if iter.peek().is_none() {
+        engine.end();
+        return Ok(());
+    }
+
+    let mut next_start = config.start();
+
+    loop {
+        let mut chunk = take_aligned_chunk(&mut iter, chunk_size);
+        if chunk.is_empty() {
+            break;
+        }
+        chunk.sort_by_key(HasTsInit::ts_init);
+
+        let is_last = iter.peek().is_none();
+        let end = if is_last {
+            config.end()
+        } else {
+            chunk.last().map(HasTsInit::ts_init)
+        };
+
+        engine.add_data(chunk, None, false, true)?;
+        engine.run(next_start, end, Some(config.id().to_string()), true)?;
+        engine.clear_data();
+
+        if engine.kernel().is_shutdown_requested() {
+            return Ok(());
+        }
+
+        next_start = end;
+    }
+
+    engine.end();
+    Ok(())
 }
 
 // Feeds data from an iterator to the engine in timestamp-aligned chunks.
