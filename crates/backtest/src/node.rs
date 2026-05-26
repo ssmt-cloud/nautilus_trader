@@ -404,13 +404,84 @@ fn run_streaming(
         let mut catalog = create_catalog(data_config)?;
         let result = dispatch_query(&mut catalog, data_config, config.start(), config.end())?;
         stream_chunks(engine, config, result.peekable(), chunk_size)?;
+    } else if can_share_catalog(data_configs) {
+        // Multiple configs sharing the same catalog backend: register each
+        // data type's query into one DataBackendSession, then take one
+        // merged QueryResult (a KMerge over all DataFusion batch streams)
+        // and chunk-stream it. Memory stays bounded; we do not materialize
+        // per-type Vec<Data> the way the eager fallback below does.
+        let mut catalog = create_catalog(&data_configs[0])?;
+        catalog.reset_session();
+        for data_config in data_configs {
+            dispatch_register_query(
+                &mut catalog,
+                data_config,
+                config.start(),
+                config.end(),
+            )?;
+        }
+        let merged = catalog.session.get_query_result();
+        stream_chunks(engine, config, merged.peekable(), chunk_size)?;
     } else {
-        // Multiple configs require loading all data to merge-sort across types
+        // Distinct catalog backends across configs (different protocol /
+        // storage options): DataFusion registers object stores per-session
+        // so we can't merge into one session. Fall back to eager merge.
         let all_data = load_and_merge_data(config)?;
         stream_chunks(engine, config, all_data.into_iter().peekable(), chunk_size)?;
     }
 
     Ok(())
+}
+
+fn can_share_catalog(configs: &[BacktestDataConfig]) -> bool {
+    let first = &configs[0];
+    configs.iter().all(|c| {
+        c.catalog_path() == first.catalog_path()
+            && c.catalog_fs_protocol() == first.catalog_fs_protocol()
+            && c.catalog_fs_storage_options() == first.catalog_fs_storage_options()
+            && c.catalog_fs_rust_storage_options() == first.catalog_fs_rust_storage_options()
+    })
+}
+
+// Variant of `dispatch_query` that registers files into the catalog's
+// shared session without consuming a QueryResult. Used by the multi-config
+// streaming path: callers register N times then call
+// `catalog.session.get_query_result()` once to obtain a merged stream.
+fn dispatch_register_query(
+    catalog: &mut ParquetDataCatalog,
+    config: &BacktestDataConfig,
+    run_start: Option<UnixNanos>,
+    run_end: Option<UnixNanos>,
+) -> anyhow::Result<()> {
+    let identifiers = config.query_identifiers();
+    let start = max_opt(config.start_time(), run_start);
+    let end = min_opt(config.end_time(), run_end);
+    let filter = config.filter_expr();
+    let optimize = config.optimize_file_loading();
+
+    match config.data_type() {
+        NautilusDataType::QuoteTick => {
+            catalog.register_query::<QuoteTick>(identifiers, start, end, filter, None, optimize)
+        }
+        NautilusDataType::TradeTick => {
+            catalog.register_query::<TradeTick>(identifiers, start, end, filter, None, optimize)
+        }
+        NautilusDataType::Bar => {
+            catalog.register_query::<Bar>(identifiers, start, end, filter, None, optimize)
+        }
+        NautilusDataType::OrderBookDelta => catalog
+            .register_query::<OrderBookDelta>(identifiers, start, end, filter, None, optimize),
+        NautilusDataType::OrderBookDepth10 => catalog
+            .register_query::<OrderBookDepth10>(identifiers, start, end, filter, None, optimize),
+        NautilusDataType::MarkPriceUpdate => catalog
+            .register_query::<MarkPriceUpdate>(identifiers, start, end, filter, None, optimize),
+        NautilusDataType::IndexPriceUpdate => catalog
+            .register_query::<IndexPriceUpdate>(identifiers, start, end, filter, None, optimize),
+        NautilusDataType::InstrumentStatus => catalog
+            .register_query::<InstrumentStatus>(identifiers, start, end, filter, None, optimize),
+        NautilusDataType::InstrumentClose => catalog
+            .register_query::<InstrumentClose>(identifiers, start, end, filter, None, optimize),
+    }
 }
 
 // Feeds data from an iterator to the engine in timestamp-aligned chunks.
