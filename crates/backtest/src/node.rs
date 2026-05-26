@@ -519,30 +519,92 @@ fn stream_chunks_resort<I: Iterator<Item = Data>>(
     }
 
     let mut next_start = config.start();
+    let mut chunk_idx: usize = 0;
+    let mut last_yielded_ts: Option<UnixNanos> = None;
 
     loop {
         let mut chunk = take_aligned_chunk(&mut iter, chunk_size);
         if chunk.is_empty() {
             break;
         }
+
+        // Diagnostic: verify the upstream merged stream is globally
+        // ascending by ts_init across chunks. If it is not, the
+        // multi-config KMerge has a correctness bug we have not yet
+        // identified — log loudly with both prior boundary and chunk min.
+        let chunk_min_pre_sort = chunk
+            .first()
+            .map(HasTsInit::ts_init)
+            .expect("non-empty chunk has a first item");
+        if let Some(prev) = last_yielded_ts
+            && chunk_min_pre_sort < prev
+        {
+            log::warn!(
+                "stream_chunks_resort: chunk {} first ts {} < previous chunk last ts {} \
+                 (upstream merge produced backwards-going items; sorting locally to repair)",
+                chunk_idx,
+                chunk_min_pre_sort,
+                prev,
+            );
+        }
+
         chunk.sort_by_key(HasTsInit::ts_init);
+        let chunk_max = chunk
+            .last()
+            .map(HasTsInit::ts_init)
+            .expect("non-empty chunk has a last item");
+
+        // Even after local sort, the cross-chunk invariant
+        // (chunk_max_N+1 >= chunk_max_N) may be violated if items leaked
+        // into chunk N+1 with ts strictly less than chunk_max_N. In that
+        // case clamp the engine start to chunk_min so the engine can still
+        // process this chunk, log a warning, and skip the boundary update.
+        let effective_start = if let Some(prev) = last_yielded_ts
+            && chunk_max < prev
+        {
+            log::warn!(
+                "stream_chunks_resort: chunk {} max ts {} < previous chunk max ts {}; \
+                 clamping engine start to chunk min {} to avoid start>end",
+                chunk_idx,
+                chunk_max,
+                prev,
+                chunk_min_pre_sort,
+            );
+            Some(chunk_min_pre_sort)
+        } else {
+            next_start
+        };
 
         let is_last = iter.peek().is_none();
         let end = if is_last {
-            config.end()
+            config.end().or(Some(chunk_max))
         } else {
-            chunk.last().map(HasTsInit::ts_init)
+            Some(chunk_max)
         };
 
         engine.add_data(chunk, None, false, true)?;
-        engine.run(next_start, end, Some(config.id().to_string()), true)?;
+        engine.run(
+            effective_start,
+            end,
+            Some(config.id().to_string()),
+            true,
+        )?;
         engine.clear_data();
 
         if engine.kernel().is_shutdown_requested() {
             return Ok(());
         }
 
-        next_start = end;
+        // Only advance the boundary forward — never let a backward chunk
+        // pull next_start into the past.
+        let new_boundary = match (last_yielded_ts, end) {
+            (Some(prev), Some(e)) => Some(prev.max(e)),
+            (None, end) => end,
+            (some, None) => some,
+        };
+        next_start = new_boundary;
+        last_yielded_ts = new_boundary;
+        chunk_idx += 1;
     }
 
     engine.end();
