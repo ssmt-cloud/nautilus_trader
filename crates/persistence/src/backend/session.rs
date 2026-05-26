@@ -189,8 +189,31 @@ impl DataBackendSession {
             let default_query = format!("SELECT * FROM {table_name} ORDER BY ts_init");
             let sql_query = sql_query.unwrap_or(&default_query);
             let query = self.runtime.block_on(self.session_ctx.sql(sql_query))?;
+
+            // Gap #3 from the KMerge OOO investigation: log the physical
+            // plan for the registered query so we can correlate observed
+            // OOO yields to the actual DataFusion plan structure. Gated
+            // at debug level — only fires when RUST_LOG=…=debug is set.
+            if log::log_enabled!(log::Level::Debug)
+                && let Ok(plan) = self.runtime.block_on(query.clone().create_physical_plan())
+            {
+                let displayed = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                log::debug!(
+                    "add_file physical plan for table={} (file_path={}):\n{}",
+                    table_name,
+                    file_path,
+                    displayed,
+                );
+            }
+
             let batch_stream = self.runtime.block_on(query.execute_stream())?;
-            self.add_batch_stream::<T>(batch_stream, custom_type_name.map(String::from));
+            self.add_batch_stream::<T>(
+                batch_stream,
+                custom_type_name.map(String::from),
+                table_name.to_string(),
+            );
         }
 
         Ok(())
@@ -240,9 +263,23 @@ impl DataBackendSession {
         &mut self,
         stream: SendableRecordBatchStream,
         custom_type_name: Option<String>,
+        table_label: String,
     ) where
         T: DecodeDataFromRecordBatch,
     {
+        // Per-stream sortedness verification (Gap #1 from the KMerge OOO
+        // investigation). The FnMut closure on `Stream::map` lets us
+        // maintain state across batches; we log on within-batch OOO and
+        // cross-batch OOO, naming the table so consumers can correlate
+        // back to a specific (data_type, instrument) directory.
+        //
+        // Cost is two ts_init comparisons per batch — negligible relative
+        // to decode and downstream processing. Left always-on so any
+        // future regression is caught in production runs without
+        // needing a special build.
+        let mut prev_batch_last_ts: Option<UnixNanos> = None;
+        let mut batch_idx: usize = 0;
+        let label_for_closure = table_label;
         let transform = stream.map(move |result| match result {
             Ok(batch) => {
                 let mut metadata: std::collections::HashMap<String, String> =
@@ -251,7 +288,49 @@ impl DataBackendSession {
                 if let Some(ref tn) = custom_type_name {
                     metadata.insert("type_name".to_string(), tn.clone());
                 }
-                T::decode_data_batch(&metadata, batch).unwrap().into_iter()
+                let decoded = T::decode_data_batch(&metadata, batch).unwrap();
+
+                let first_ts = decoded.first().map(HasTsInit::ts_init);
+                let last_ts = decoded.last().map(HasTsInit::ts_init);
+
+                // Cross-batch monotonicity check.
+                if let (Some(prev), Some(first)) = (prev_batch_last_ts, first_ts)
+                    && first < prev
+                {
+                    log::warn!(
+                        "add_batch_stream OOO (cross-batch): table={} batch_idx={} batch_first_ts={} < prev_batch_last_ts={} (gap={}ns)",
+                        label_for_closure,
+                        batch_idx,
+                        first,
+                        prev,
+                        u64::from(prev).saturating_sub(u64::from(first)),
+                    );
+                }
+
+                // Within-batch monotonicity check (scan once; bail at the
+                // first violation so we do not flood the log on a wholly
+                // unsorted batch).
+                for w in decoded.windows(2) {
+                    let a = w[0].ts_init();
+                    let b = w[1].ts_init();
+                    if a > b {
+                        log::warn!(
+                            "add_batch_stream OOO (within-batch): table={} batch_idx={} a_ts={} > b_ts={} (gap={}ns)",
+                            label_for_closure,
+                            batch_idx,
+                            a,
+                            b,
+                            u64::from(a).saturating_sub(u64::from(b)),
+                        );
+                        break;
+                    }
+                }
+
+                if let Some(ts) = last_ts {
+                    prev_batch_last_ts = Some(ts);
+                }
+                batch_idx += 1;
+                decoded.into_iter()
             }
             Err(e) => panic!("Error getting next batch from RecordBatchStream: {e}"),
         });

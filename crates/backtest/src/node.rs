@@ -434,7 +434,14 @@ fn run_streaming(
             )?;
         }
         let merged = catalog.session.get_query_result();
-        stream_chunks_resort(engine, config, merged.peekable(), chunk_size)?;
+        // Gap #4 from the KMerge OOO investigation: wrap the merged
+        // KMerge output in an OrderingVerifier that logs every backward
+        // yield with both the offending ts and the immediately-prior
+        // yield's ts. Lets us distinguish "KMerge itself is yielding
+        // backward" from "yields are monotonic but stream_chunks_resort
+        // is computing the wrong chunk boundary".
+        let verified = OrderingVerifier::new(merged, "multi-config-kmerge");
+        stream_chunks_resort(engine, config, verified.peekable(), chunk_size)?;
     } else {
         // Distinct catalog backends across configs (different protocol /
         // storage options): DataFusion registers object stores per-session
@@ -503,6 +510,69 @@ fn dispatch_register_query(
             .register_query::<InstrumentStatus>(identifiers, start, end, filter, None, optimize),
         NautilusDataType::InstrumentClose => catalog
             .register_query::<InstrumentClose>(identifiers, start, end, filter, None, optimize),
+    }
+}
+
+// Wraps an `Iterator<Item = Data>` and logs a WARN every time it yields
+// an item with `ts_init` strictly less than the previous yield. Diagnostic
+// scaffold for the KMerge OOO investigation — answers "is the upstream
+// KMerge yielding backward, or is the chunk-boundary math wrong?" without
+// requiring a special build. Always-on; cost is one comparison per yield.
+struct OrderingVerifier<I: Iterator<Item = Data>> {
+    inner: I,
+    last_ts: Option<UnixNanos>,
+    label: &'static str,
+    violations: usize,
+}
+
+impl<I: Iterator<Item = Data>> OrderingVerifier<I> {
+    fn new(inner: I, label: &'static str) -> Self {
+        Self {
+            inner,
+            last_ts: None,
+            label,
+            violations: 0,
+        }
+    }
+}
+
+impl<I: Iterator<Item = Data>> Iterator for OrderingVerifier<I> {
+    type Item = Data;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next()?;
+        let ts = item.ts_init();
+        if let Some(prev) = self.last_ts
+            && ts < prev
+        {
+            self.violations += 1;
+            // Log up to 50 violations in detail (enough to characterise
+            // the pattern), then count silently. Avoids drowning the log
+            // on pathological inputs.
+            if self.violations <= 50 {
+                log::warn!(
+                    "OrderingVerifier[{}] backward yield #{}: ts={} prev={} gap={}ns",
+                    self.label,
+                    self.violations,
+                    ts,
+                    prev,
+                    u64::from(prev).saturating_sub(u64::from(ts)),
+                );
+            } else if self.violations.is_power_of_two() {
+                log::warn!(
+                    "OrderingVerifier[{}] backward yield count now {} (further violations suppressed unless power-of-two)",
+                    self.label,
+                    self.violations,
+                );
+            }
+        }
+        // Update last_ts to the max seen so a single backward yield
+        // doesn't reset the baseline and hide subsequent backward yields.
+        self.last_ts = Some(match self.last_ts {
+            Some(prev) => prev.max(ts),
+            None => ts,
+        });
+        Some(item)
     }
 }
 
