@@ -16,7 +16,11 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{Array, UInt64Array},
+    compute::{concat_batches, lexsort_to_indices, take, SortColumn, SortOptions},
+    record_batch::RecordBatch,
+};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -28,6 +32,30 @@ use parquet::{
     },
 };
 use url::Url;
+
+/// Cheap O(n) single-pass check that an Arrow column (expected: `ts_init`,
+/// a `UInt64` column of unix-nanos) is monotonically non-decreasing. Used
+/// as a `debug_assert!` post-condition in `combine_parquet_files_*` to
+/// catch any future regression in the sort step. Returns `true` for empty
+/// columns and for unexpected types (i.e. only fires when we can prove a
+/// violation).
+fn is_monotonic_ts(col: &dyn Array) -> bool {
+    let Some(ts) = col.as_any().downcast_ref::<UInt64Array>() else {
+        return true;
+    };
+    if ts.len() < 2 {
+        return true;
+    }
+    let mut prev = ts.value(0);
+    for i in 1..ts.len() {
+        let v = ts.value(i);
+        if v < prev {
+            return false;
+        }
+        prev = v;
+    }
+    true
+}
 
 pub(crate) fn is_remote_uri_scheme(scheme: &str) -> bool {
     matches!(
@@ -354,11 +382,61 @@ pub async fn combine_parquet_files_from_object_store(
             .collect();
     }
 
-    // Deduplicate rows if requested
-    let batches_to_write = if deduplicate.unwrap_or(false) {
-        deduplicate_record_batches(&all_batches)?
-    } else {
+    // Merge-sort all rows by `ts_init` before deduplication/writing. The
+    // source per-day files are individually sorted, but they can overlap
+    // in time (consolidation passes that include partial-day or back-fill
+    // files, or unsorted writes from earlier tooling), and a naive
+    // file-by-file concatenation then produces sorted runs concatenated
+    // out of order — observable downstream as items arriving in
+    // backward-in-time order. The catalog's read path declares
+    // `file_sort_order=[ts_init asc]` to DataFusion and trusts it, so any
+    // disorder here propagates silently into KMerge / engine state and
+    // causes drops via the orderbook's stale-tick guard.
+    //
+    // See investigation: see commit history on the
+    // `ssmt-prod-c7a165d089-streaming-load` branch.
+    let batches_to_write = if all_batches.is_empty() {
         all_batches
+    } else {
+        let schema = all_batches[0].schema();
+        let combined = concat_batches(&schema, &all_batches)?;
+        let ts_init_idx = combined
+            .schema()
+            .index_of("ts_init")
+            .map_err(|_| anyhow::anyhow!("combined batches missing ts_init column for merge-sort"))?;
+        let ts_col = combined.column(ts_init_idx);
+        let indices = lexsort_to_indices(
+            &[SortColumn {
+                values: ts_col.clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            }],
+            None,
+        )?;
+        let sorted_cols: Vec<_> = combined
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), &indices, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sorted = RecordBatch::try_new(combined.schema(), sorted_cols)?;
+
+        // Defense in depth: assert the sort actually produced
+        // monotonic ts_init. Cheap (O(n) single pass over one column)
+        // and catches any future regression in the arrow compute layer.
+        debug_assert!(
+            is_monotonic_ts(sorted.column(ts_init_idx)),
+            "post-sort ts_init column is not monotonic — combine_parquet_files_from_object_store bug"
+        );
+
+        vec![sorted]
+    };
+
+    let batches_to_write = if deduplicate.unwrap_or(false) {
+        deduplicate_record_batches(&batches_to_write)?
+    } else {
+        batches_to_write
     };
 
     // Write combined batches to new location

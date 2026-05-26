@@ -315,7 +315,20 @@ impl ParquetDataCatalog {
             }
         }
 
-        intervals.sort_by_key(|&(start, _)| start);
+        // Sort files and intervals together so that
+        // `combine_parquet_files_from_object_store` receives files in
+        // chronological order (it now also merge-sorts row contents, but
+        // keeping files in order minimises the amount of in-memory
+        // shuffling the sort has to do). Previously only `intervals` was
+        // sorted while `files_to_consolidate` was left in object-store
+        // listing order — see the OOO investigation on the
+        // `ssmt-prod-c7a165d089-streaming-load` branch.
+        let mut paired: Vec<(_, _)> = intervals
+            .into_iter()
+            .zip(files_to_consolidate.into_iter())
+            .collect();
+        paired.sort_by_key(|((start, _), _)| *start);
+        let (intervals, files_to_consolidate): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
 
         if !intervals.is_empty() {
             let file_name = timestamps_to_filename(
