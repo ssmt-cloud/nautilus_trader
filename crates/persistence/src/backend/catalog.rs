@@ -1563,6 +1563,40 @@ impl ParquetDataCatalog {
     where
         T: DecodeDataFromRecordBatch + CatalogPathPrefix,
     {
+        self.register_query::<T>(
+            identifiers,
+            start,
+            end,
+            where_clause,
+            files,
+            optimize_file_loading,
+        )?;
+        Ok(self.session.get_query_result())
+    }
+
+    /// Same registration logic as [`Self::query`] but does NOT consume/return
+    /// the [`QueryResult`]. Use this when you need to merge multiple data-type
+    /// queries (e.g. bars + quotes + trades) into one chronologically-merged
+    /// replay stream: call `register_query::<T>` once per data type, then
+    /// call `self.session.get_query_result()` to obtain a single KMerge over
+    /// all registered streams.
+    ///
+    /// This is the primitive that makes multi-data-type backtests memory-
+    /// bounded: without it, callers must materialize each type into a
+    /// `Vec<Data>` and merge in RAM (see node.rs `load_and_merge_data` for
+    /// the eager fallback).
+    pub fn register_query<T>(
+        &mut self,
+        identifiers: Option<Vec<String>>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        where_clause: Option<&str>,
+        files: Option<Vec<String>>,
+        optimize_file_loading: bool,
+    ) -> anyhow::Result<()>
+    where
+        T: DecodeDataFromRecordBatch + CatalogPathPrefix,
+    {
         // Register the object store with the session for remote URIs only.
         // For local file:// we do not register: we pass full file URLs to register_parquet
         // so DataFusion's default file provider handles them (avoids path doubling on Windows
@@ -1630,7 +1664,7 @@ impl ParquetDataCatalog {
             }
         }
 
-        Ok(self.session.get_query_result())
+        Ok(())
     }
 
     /// Queries typed data from the catalog and returns results as a strongly-typed vector.
