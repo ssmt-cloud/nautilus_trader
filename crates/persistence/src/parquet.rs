@@ -1026,9 +1026,165 @@ fn extract_host(url: &url::Url, error_msg: &str) -> anyhow::Result<String> {
 mod tests {
     #[cfg(feature = "cloud")]
     use ahash::AHashMap;
+    use arrow::array::Float64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use object_store::local::LocalFileSystem;
+    use parquet::arrow::ArrowWriter;
     use rstest::rstest;
 
     use super::*;
+
+    /// Writes a single-column-ish (`ts_init` + `value`) parquet file at
+    /// `path` containing the given timestamps in the given (possibly
+    /// unsorted) order. Used by combine_parquet_files_from_object_store
+    /// tests to fabricate overlapping inputs.
+    fn write_unsorted_test_file(path: &std::path::Path, ts_init_values: &[u64]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let ts = UInt64Array::from(ts_init_values.to_vec());
+        let value: Vec<f64> = ts_init_values.iter().map(|t| *t as f64 / 1e9).collect();
+        let vals = Float64Array::from(value);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ts) as Arc<dyn Array>, Arc::new(vals)],
+        )
+        .unwrap();
+        let f = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(f, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[rstest]
+    fn test_combine_merge_sorts_overlapping_inputs() {
+        // Reproduces the SSMT bar-consolidation bug: two input files
+        // whose ts ranges overlap. Prior behaviour was to concatenate
+        // them in scan order, producing an output file with rows in
+        // backward-going order at the file boundary. Fixed behaviour
+        // is a full merge-sort by ts_init.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_a = tmp.path().join("a.parquet");
+        let file_b = tmp.path().join("b.parquet");
+        let out = tmp.path().join("merged.parquet");
+
+        // file_a covers 10..15, file_b covers 12..18 — overlap on [12, 14].
+        write_unsorted_test_file(&file_a, &[10, 11, 12, 13, 14, 15]);
+        write_unsorted_test_file(&file_b, &[12, 13, 14, 15, 16, 17, 18]);
+
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(combine_parquet_files_from_object_store(
+                object_store.clone(),
+                vec![
+                    ObjectPath::from("a.parquet"),
+                    ObjectPath::from("b.parquet"),
+                ],
+                &ObjectPath::from("merged.parquet"),
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+
+        // Read merged file and verify ts_init is monotonically non-decreasing.
+        let f = std::fs::File::open(&out).unwrap();
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut ts_values: Vec<u64> = Vec::new();
+        for batch in reader.by_ref() {
+            let batch = batch.unwrap();
+            let col = batch
+                .column(batch.schema().index_of("ts_init").unwrap())
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                ts_values.push(col.value(i));
+            }
+        }
+        assert_eq!(
+            ts_values.len(),
+            13,
+            "should contain all rows from both inputs (no dedup requested)"
+        );
+        for w in ts_values.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "post-combine ts_init is not monotonic: {:?}",
+                ts_values
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_combine_merge_sorts_input_in_wrong_order() {
+        // Files passed in reverse-time order — combine should still
+        // produce a globally-sorted output (the parallel-vector sort
+        // bug in consolidate_directory used to leave this case
+        // exposed).
+        let tmp = tempfile::tempdir().unwrap();
+        let early = tmp.path().join("early.parquet");
+        let late = tmp.path().join("late.parquet");
+
+        write_unsorted_test_file(&early, &[100, 101, 102, 103, 104]);
+        write_unsorted_test_file(&late, &[200, 201, 202, 203, 204]);
+
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(combine_parquet_files_from_object_store(
+                object_store.clone(),
+                // Reverse order: late file first.
+                vec![
+                    ObjectPath::from("late.parquet"),
+                    ObjectPath::from("early.parquet"),
+                ],
+                &ObjectPath::from("merged.parquet"),
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+
+        let out = tmp.path().join("merged.parquet");
+        let f = std::fs::File::open(&out).unwrap();
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut ts_values: Vec<u64> = Vec::new();
+        for batch in reader.by_ref() {
+            let batch = batch.unwrap();
+            let col = batch
+                .column(batch.schema().index_of("ts_init").unwrap())
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                ts_values.push(col.value(i));
+            }
+        }
+        assert_eq!(ts_values.first().copied(), Some(100));
+        assert_eq!(ts_values.last().copied(), Some(204));
+        for w in ts_values.windows(2) {
+            assert!(w[0] <= w[1], "merged output not monotonic: {:?}", ts_values);
+        }
+    }
 
     #[rstest]
     fn test_create_object_store_from_path_local() {
