@@ -460,7 +460,16 @@ fn dispatch_register_query(
     let start = max_opt(config.start_time(), run_start);
     let end = min_opt(config.end_time(), run_end);
     let filter = config.filter_expr();
-    let optimize = config.optimize_file_loading();
+    // Force directory-based registration in the multi-config streaming path:
+    // file-based registration creates one DataFusion table per parquet file and
+    // relies on `file_sort_order` to skip the SortExec node. With many small
+    // tables fed into a KMerge across heterogeneous data types, we have seen
+    // out-of-order yields that violate the engine's `start <= end` invariant
+    // in stream_chunks. Directory-based registration produces one table per
+    // (data_type, instrument) directory, which DataFusion handles with a
+    // deterministic ordered scan plan across the contained files.
+    let optimize = true;
+    let _ = config.optimize_file_loading();
 
     match config.data_type() {
         NautilusDataType::QuoteTick => {
