@@ -82,9 +82,19 @@ impl DataBackendSession {
             .enable_all()
             .build()
             .unwrap();
+        // Note: prefer_existing_sort is intentionally left at its DataFusion
+        // default (false). Setting it to true allows DataFusion to drop the
+        // SortExec when a table declares file_sort_order, but for catalog
+        // tables that span multiple parquet files (per-instrument directories
+        // or per-day files), the scan order across files is not guaranteed
+        // chronological — files may overlap in ts_init, or the listing-table
+        // task scheduler may interleave row groups. With the SortExec
+        // dropped, downstream KMerge consumers observe items 1-3 days out of
+        // order, which breaks any streaming-merge logic that trusts upstream
+        // ordering. Leaving the SortExec in place costs a per-batch in-memory
+        // sort but is cheap relative to the rest of the pipeline.
         let session_cfg = SessionConfig::new()
-            .set_str("datafusion.optimizer.repartition_file_scans", "false")
-            .set_str("datafusion.optimizer.prefer_existing_sort", "true");
+            .set_str("datafusion.optimizer.repartition_file_scans", "false");
         let session_ctx = SessionContext::new_with_config(session_cfg);
         Self {
             session_ctx,
@@ -275,10 +285,10 @@ impl DataBackendSession {
         self.registered_tables.clear();
         self.batch_streams.clear();
 
-        // Create a new session context to completely reset the DataFusion state
+        // Create a new session context to completely reset the DataFusion state.
+        // See `new` for why prefer_existing_sort is intentionally not set.
         let session_cfg = SessionConfig::new()
-            .set_str("datafusion.optimizer.repartition_file_scans", "false")
-            .set_str("datafusion.optimizer.prefer_existing_sort", "true");
+            .set_str("datafusion.optimizer.repartition_file_scans", "false");
         self.session_ctx = SessionContext::new_with_config(session_cfg);
     }
 }
