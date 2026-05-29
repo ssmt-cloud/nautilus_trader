@@ -510,6 +510,8 @@ fn dispatch_register_query(
             .register_query::<InstrumentStatus>(identifiers, start, end, filter, None, optimize),
         NautilusDataType::InstrumentClose => catalog
             .register_query::<InstrumentClose>(identifiers, start, end, filter, None, optimize),
+        NautilusDataType::OptionGreeks => catalog
+            .register_query::<OptionGreeks>(identifiers, start, end, filter, None, optimize),
     }
 }
 
