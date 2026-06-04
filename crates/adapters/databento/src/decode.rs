@@ -44,7 +44,11 @@
 //! - [`UNDEF_TIMESTAMP`](https://docs.rs/dbn/latest/dbn/constant.UNDEF_TIMESTAMP.html)
 //! - [Databento DBN Schema](https://databento.com/docs/schemas)
 
-use std::{ffi::c_char, num::NonZeroUsize};
+use std::{
+    ffi::c_char,
+    num::NonZeroUsize,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use databento::dbn;
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_SECOND};
@@ -72,6 +76,23 @@ use super::{
     enums::{DatabentoStatisticType, DatabentoStatisticUpdateAction},
     types::{DatabentoImbalance, DatabentoStatistics},
 };
+
+/// Cumulative count of trade records dropped during decoding because their
+/// reported `size` was non-positive (zero).
+///
+/// Databento occasionally emits zero-size trade prints; constructing a
+/// [`TradeTick`] from one panics (`Quantity` must be positive), so such records
+/// are skipped on the live path. This counter exposes how often that happens
+/// without logging on the hot path — read it to confirm drops are occurring
+/// independently of the feed's cumulative quote/trade counters (which freeze if
+/// the decode worker panics).
+pub static ZERO_SIZE_TRADES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Records that a zero-size trade record was skipped during decoding.
+#[inline]
+fn record_zero_size_trade_skip() {
+    ZERO_SIZE_TRADES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
 
 const STEP_ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
@@ -577,6 +598,10 @@ pub fn decode_mbo_msg(
 
 /// Decodes a Databento Trade message into a `TradeTick`.
 ///
+/// Returns `Ok(None)` when the trade has a non-positive (zero) size, which
+/// Databento can emit — constructing a `TradeTick` from a zero `Quantity` would
+/// panic, so the record is skipped.
+///
 /// # Errors
 ///
 /// Returns an error if decoding the Trade message fails.
@@ -585,7 +610,12 @@ pub fn decode_trade_msg(
     instrument_id: InstrumentId,
     price_precision: u8,
     ts_init: Option<UnixNanos>,
-) -> anyhow::Result<TradeTick> {
+) -> anyhow::Result<Option<TradeTick>> {
+    if msg.size == 0 {
+        record_zero_size_trade_skip();
+        return Ok(None);
+    }
+
     let ts_event = msg.ts_recv.into();
     let ts_init = ts_init.unwrap_or(ts_event);
 
@@ -599,13 +629,14 @@ pub fn decode_trade_msg(
         ts_init,
     );
 
-    Ok(trade)
+    Ok(Some(trade))
 }
 
 /// Decodes a Databento TBBO (Top of Book with Trade) message into quote and trade ticks.
 ///
 /// Returns `None` for the quote if either bid or ask price is undefined (`i64::MAX`).
-/// The trade is always returned.
+/// Returns `None` for the trade if its size is non-positive (zero), which Databento
+/// can emit — constructing a `TradeTick` from a zero `Quantity` would panic.
 ///
 /// # Errors
 ///
@@ -615,7 +646,7 @@ pub fn decode_tbbo_msg(
     instrument_id: InstrumentId,
     price_precision: u8,
     ts_init: Option<UnixNanos>,
-) -> anyhow::Result<(Option<QuoteTick>, TradeTick)> {
+) -> anyhow::Result<(Option<QuoteTick>, Option<TradeTick>)> {
     let top_level = &msg.levels[0];
     let ts_event = msg.ts_recv.into();
     let ts_init = ts_init.unwrap_or(ts_event);
@@ -634,17 +665,24 @@ pub fn decode_tbbo_msg(
         None
     };
 
-    let trade = TradeTick::new(
-        instrument_id,
-        decode_price_or_undef(msg.price, price_precision),
-        decode_quantity(msg.size as u64),
-        parse_aggressor_side(msg.side),
-        TradeId::new(itoa::Buffer::new().format(msg.sequence)),
-        ts_event,
-        ts_init,
-    );
+    let maybe_trade = if msg.size > 0 {
+        Some(TradeTick::new(
+            instrument_id,
+            decode_price_or_undef(msg.price, price_precision),
+            decode_quantity(msg.size as u64),
+            parse_aggressor_side(msg.side),
+            TradeId::new(itoa::Buffer::new().format(msg.sequence)),
+            ts_event,
+            ts_init,
+        ))
+    } else {
+        // Databento can emit a zero-size trade print; skip rather than
+        // construct a `TradeTick` (which would panic on a zero `Quantity`).
+        record_zero_size_trade_skip();
+        None
+    };
 
-    Ok((maybe_quote, trade))
+    Ok((maybe_quote, maybe_trade))
 }
 
 /// Decodes a Databento MBP1 (Market by Price Level 1) message into quote and optional trade ticks.
@@ -680,15 +718,22 @@ pub fn decode_mbp1_msg(
     };
 
     let maybe_trade = if include_trades && is_trade_msg(msg.action) {
-        Some(TradeTick::new(
-            instrument_id,
-            decode_price_or_undef(msg.price, price_precision),
-            decode_quantity(msg.size as u64),
-            parse_aggressor_side(msg.side),
-            TradeId::new(itoa::Buffer::new().format(msg.sequence)),
-            ts_event,
-            ts_init,
-        ))
+        if msg.size > 0 {
+            Some(TradeTick::new(
+                instrument_id,
+                decode_price_or_undef(msg.price, price_precision),
+                decode_quantity(msg.size as u64),
+                parse_aggressor_side(msg.side),
+                TradeId::new(itoa::Buffer::new().format(msg.sequence)),
+                ts_event,
+                ts_init,
+            ))
+        } else {
+            // Databento can emit a zero-size trade print; skip rather than
+            // construct a `TradeTick` (which would panic on a zero `Quantity`).
+            record_zero_size_trade_skip();
+            None
+        }
     } else {
         None
     };
@@ -857,24 +902,31 @@ pub fn decode_cmbp1_msg(
     };
 
     let maybe_trade = if include_trades && is_trade_msg(msg.action) {
-        // CMBP1 does not publish a native trade ID; derive a deterministic one
-        let trade_id = derive_cmbp_trade_id(
-            instrument_id,
-            msg.hd.ts_event,
-            msg.ts_recv,
-            msg.price,
-            msg.size,
-            msg.side,
-        );
-        Some(TradeTick::new(
-            instrument_id,
-            decode_price_or_undef(msg.price, price_precision),
-            decode_quantity(msg.size as u64),
-            parse_aggressor_side(msg.side),
-            trade_id,
-            ts_event,
-            ts_init,
-        ))
+        if msg.size > 0 {
+            // CMBP1 does not publish a native trade ID; derive a deterministic one
+            let trade_id = derive_cmbp_trade_id(
+                instrument_id,
+                msg.hd.ts_event,
+                msg.ts_recv,
+                msg.price,
+                msg.size,
+                msg.side,
+            );
+            Some(TradeTick::new(
+                instrument_id,
+                decode_price_or_undef(msg.price, price_precision),
+                decode_quantity(msg.size as u64),
+                parse_aggressor_side(msg.side),
+                trade_id,
+                ts_event,
+                ts_init,
+            ))
+        } else {
+            // Databento can emit a zero-size trade print; skip rather than
+            // construct a `TradeTick` (which would panic on a zero `Quantity`).
+            record_zero_size_trade_skip();
+            None
+        }
     } else {
         None
     };
@@ -1137,8 +1189,8 @@ pub fn decode_record(
         }
     } else if let Some(msg) = record.get::<dbn::TradeMsg>() {
         let ts_init = determine_timestamp(ts_init, msg.ts_recv.into());
-        let trade = decode_trade_msg(msg, instrument_id, price_precision, Some(ts_init))?;
-        (Some(Data::Trade(trade)), None)
+        let maybe_trade = decode_trade_msg(msg, instrument_id, price_precision, Some(ts_init))?;
+        (maybe_trade.map(Data::Trade), None)
     } else if let Some(msg) = record.get::<dbn::Mbp1Msg>() {
         let ts_init = determine_timestamp(ts_init, msg.ts_recv.into());
         let (maybe_quote, maybe_trade) = decode_mbp1_msg(
@@ -1183,11 +1235,12 @@ pub fn decode_record(
         )?;
         (maybe_quote.map(Data::Quote), maybe_trade.map(Data::Trade))
     } else if let Some(msg) = record.get::<dbn::TbboMsg>() {
-        // TBBO always has a trade, quote may be skipped if prices undefined
+        // TBBO carries a trade (quote may be skipped if prices undefined, trade
+        // may be skipped if its size is zero).
         let ts_init = determine_timestamp(ts_init, msg.ts_recv.into());
-        let (maybe_quote, trade) =
+        let (maybe_quote, maybe_trade) =
             decode_tbbo_msg(msg, instrument_id, price_precision, Some(ts_init))?;
-        (maybe_quote.map(Data::Quote), Some(Data::Trade(trade)))
+        (maybe_quote.map(Data::Quote), maybe_trade.map(Data::Trade))
     } else if let Some(msg) = record.get::<dbn::CbboMsg>() {
         // Check if this is a TCBBO or regular CBBO based on whether it has trade data
         if msg.price != i64::MAX && msg.size > 0 {
@@ -2347,7 +2400,9 @@ mod tests {
         let msg = dbn_stream.next().unwrap().unwrap();
 
         let instrument_id = InstrumentId::from("ESM4.GLBX");
-        let trade = decode_trade_msg(msg, instrument_id, 2, Some(0.into())).unwrap();
+        let trade = decode_trade_msg(msg, instrument_id, 2, Some(0.into()))
+            .unwrap()
+            .expect("Expected trade for size > 0");
 
         assert_eq!(trade.instrument_id, instrument_id);
         assert_eq!(trade.price, Price::from("3720.25"));
@@ -2368,8 +2423,10 @@ mod tests {
         let msg = dbn_stream.next().unwrap().unwrap();
 
         let instrument_id = InstrumentId::from("ESM4.GLBX");
-        let (maybe_quote, trade) = decode_tbbo_msg(msg, instrument_id, 2, Some(0.into())).unwrap();
+        let (maybe_quote, maybe_trade) =
+            decode_tbbo_msg(msg, instrument_id, 2, Some(0.into())).unwrap();
         let quote = maybe_quote.expect("Expected valid quote");
+        let trade = maybe_trade.expect("Expected trade for size > 0");
 
         assert_eq!(quote.instrument_id, instrument_id);
         assert_eq!(quote.bid_price, Price::from("3720.25"));
@@ -2630,6 +2687,116 @@ mod tests {
         } else {
             assert!(trade.is_none());
         }
+    }
+
+    #[rstest]
+    fn test_decode_mbp1_msg_zero_size_trade_skipped() {
+        // Databento can emit a zero-size trade print. Building a `TradeTick`
+        // from it panics (`Quantity` must be positive), so the trade must be
+        // skipped rather than constructed.
+        let path = test_data_path().join("test_data.mbp-1.dbn.zst");
+        let mut dbn_stream = Decoder::from_zstd_file(path)
+            .unwrap()
+            .decode_stream::<dbn::Mbp1Msg>();
+        let orig = dbn_stream.next().unwrap().unwrap();
+
+        let mut msg = (*orig).clone();
+        msg.action = 'T' as c_char; // Trade action
+        msg.size = 0; // Zero-size print
+
+        let instrument_id = InstrumentId::from("ESM4.GLBX");
+        let skipped_before = ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed);
+        let (_maybe_quote, maybe_trade) =
+            decode_mbp1_msg(&msg, instrument_id, 2, Some(0.into()), true).unwrap();
+
+        assert!(
+            maybe_trade.is_none(),
+            "zero-size trade must be skipped, not constructed"
+        );
+        assert!(
+            ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed) > skipped_before,
+            "skip counter must advance"
+        );
+    }
+
+    #[rstest]
+    fn test_decode_cmbp1_msg_zero_size_trade_skipped() {
+        let path = test_data_path().join("test_data.cmbp-1.dbn.zst");
+        let mut dbn_stream = Decoder::from_zstd_file(path)
+            .unwrap()
+            .decode_stream::<dbn::Cmbp1Msg>();
+        let orig = dbn_stream.next().unwrap().unwrap();
+
+        let mut msg = (*orig).clone();
+        msg.action = 'T' as c_char; // Trade action
+        msg.size = 0; // Zero-size print
+
+        let instrument_id = InstrumentId::from("ESM4.GLBX");
+        let skipped_before = ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed);
+        let (_maybe_quote, maybe_trade) =
+            decode_cmbp1_msg(&msg, instrument_id, 2, Some(0.into()), true).unwrap();
+
+        assert!(
+            maybe_trade.is_none(),
+            "zero-size trade must be skipped, not constructed"
+        );
+        assert!(
+            ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed) > skipped_before,
+            "skip counter must advance"
+        );
+    }
+
+    #[rstest]
+    fn test_decode_trade_msg_zero_size_skipped() {
+        let path = test_data_path().join("test_data.trades.dbn.zst");
+        let mut dbn_stream = Decoder::from_zstd_file(path)
+            .unwrap()
+            .decode_stream::<dbn::TradeMsg>();
+        let orig = dbn_stream.next().unwrap().unwrap();
+
+        let mut msg = (*orig).clone();
+        msg.size = 0; // Zero-size print
+
+        let instrument_id = InstrumentId::from("ESM4.GLBX");
+        let skipped_before = ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed);
+        let maybe_trade = decode_trade_msg(&msg, instrument_id, 2, Some(0.into())).unwrap();
+
+        assert!(
+            maybe_trade.is_none(),
+            "zero-size trade must be skipped, not constructed"
+        );
+        assert!(
+            ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed) > skipped_before,
+            "skip counter must advance"
+        );
+    }
+
+    #[rstest]
+    fn test_decode_tbbo_msg_zero_size_trade_skipped() {
+        let path = test_data_path().join("test_data.tbbo.dbn.zst");
+        let mut dbn_stream = Decoder::from_zstd_file(path)
+            .unwrap()
+            .decode_stream::<dbn::Mbp1Msg>();
+        let orig = dbn_stream.next().unwrap().unwrap();
+
+        let mut msg = (*orig).clone();
+        msg.size = 0; // Zero-size print
+
+        let instrument_id = InstrumentId::from("ESM4.GLBX");
+        let skipped_before = ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed);
+        let (maybe_quote, maybe_trade) =
+            decode_tbbo_msg(&msg, instrument_id, 2, Some(0.into())).unwrap();
+
+        // Trade is skipped, but the quote is still produced (prices are valid).
+        assert!(
+            maybe_trade.is_none(),
+            "zero-size trade must be skipped, not constructed"
+        );
+        assert!(maybe_quote.is_some(), "valid quote must still be returned");
+        assert!(
+            ZERO_SIZE_TRADES_SKIPPED.load(Ordering::Relaxed) > skipped_before,
+            "skip counter must advance"
+        );
     }
 
     #[rstest]
