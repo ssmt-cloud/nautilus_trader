@@ -506,6 +506,8 @@ fn dispatch_register_query(
             .register_query::<MarkPriceUpdate>(identifiers, start, end, filter, None, optimize),
         NautilusDataType::IndexPriceUpdate => catalog
             .register_query::<IndexPriceUpdate>(identifiers, start, end, filter, None, optimize),
+        NautilusDataType::FundingRateUpdate => catalog
+            .register_query::<FundingRateUpdate>(identifiers, start, end, filter, None, optimize),
         NautilusDataType::InstrumentStatus => catalog
             .register_query::<InstrumentStatus>(identifiers, start, end, filter, None, optimize),
         NautilusDataType::InstrumentClose => catalog
