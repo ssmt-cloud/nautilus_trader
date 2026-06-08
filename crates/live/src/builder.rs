@@ -69,6 +69,11 @@ pub struct LiveNodeBuilder {
     data_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     exec_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     event_store_factory: Option<EventStoreFactory>,
+    /// Name of the execution client to register as the default routing client
+    /// (fallback for venues without a dedicated client). Needed when the data
+    /// venue (e.g. Databento `EQUS`) differs from the exec adapter's own venue
+    /// (e.g. IBKR `IB`), so orders on data-venue instruments route to the broker.
+    default_exec_client: Option<String>,
 }
 
 impl Debug for LiveNodeBuilder {
@@ -113,6 +118,7 @@ impl LiveNodeBuilder {
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             event_store_factory: None,
+            default_exec_client: None,
         })
     }
 
@@ -137,6 +143,7 @@ impl LiveNodeBuilder {
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             event_store_factory: None,
+            default_exec_client: None,
         })
     }
 
@@ -150,6 +157,20 @@ impl LiveNodeBuilder {
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// Register the named execution client as the DEFAULT routing client.
+    ///
+    /// The execution engine routes an order to the client mapped to the order's
+    /// instrument venue; if no client is registered for that venue, it falls back
+    /// to the default client. Set this when the data venue (e.g. Databento `EQUS`)
+    /// differs from the exec adapter's venue (e.g. IBKR `IB`) so the broker still
+    /// executes those orders. `name` must match the `add_exec_client` name
+    /// (defaults to the factory name, e.g. `"IB"`).
+    #[must_use]
+    pub fn with_default_exec_client(mut self, name: impl Into<String>) -> Self {
+        self.default_exec_client = Some(name.into());
         self
     }
 
@@ -458,6 +479,7 @@ impl LiveNodeBuilder {
             }
         }
 
+        let default_exec_client = self.default_exec_client.take();
         let mut exec_clients = Vec::new();
 
         for (name, factory) in self.exec_client_factories {
@@ -481,6 +503,16 @@ impl LiveNodeBuilder {
                     .borrow_mut()
                     .register_client(Box::new(client.clone()))?;
                 ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+
+                if default_exec_client.as_deref() == Some(name.as_str()) {
+                    kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .register_default_client(Box::new(client.clone()));
+                    log::info!(
+                        "Registered ExecutionClient-{client_id} as DEFAULT routing client"
+                    );
+                }
                 exec_clients.push(client);
 
                 log::info!("Registered ExecutionClient-{client_id}");
