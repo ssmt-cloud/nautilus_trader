@@ -498,12 +498,10 @@ impl LiveNodeBuilder {
                 let client_id = client.client_id();
                 let venue = client.venue();
 
-                kernel
-                    .exec_engine
-                    .borrow_mut()
-                    .register_client(Box::new(client.clone()))?;
-                ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
-
+                // Register as default-only OR venue-mapped, never both: the engine's
+                // connect() does join_all over get_clients_mut(), which would yield the
+                // same client twice (clients-map + default) and panic with "RefCell
+                // already borrowed" when both concurrently borrow_mut the shared inner.
                 if default_exec_client.as_deref() == Some(name.as_str()) {
                     kernel
                         .exec_engine
@@ -512,10 +510,15 @@ impl LiveNodeBuilder {
                     log::info!(
                         "Registered ExecutionClient-{client_id} as DEFAULT routing client"
                     );
+                } else {
+                    kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .register_client(Box::new(client.clone()))?;
+                    log::info!("Registered ExecutionClient-{client_id}");
                 }
+                ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
                 exec_clients.push(client);
-
-                log::info!("Registered ExecutionClient-{client_id}");
             } else {
                 log::warn!("No config found for execution client factory {name}");
             }
