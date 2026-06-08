@@ -36,9 +36,9 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            RequestBars, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBookDeltas,
-            SubscribeInstrument, SubscribeInstrumentStatus, SubscribeQuotes, SubscribeTrades,
-            UnsubscribeBookDeltas, UnsubscribeInstrumentStatus, UnsubscribeQuotes,
+            RequestBars, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
+            SubscribeBookDeltas, SubscribeInstrument, SubscribeInstrumentStatus, SubscribeQuotes,
+            SubscribeTrades, UnsubscribeBookDeltas, UnsubscribeInstrumentStatus, UnsubscribeQuotes,
             UnsubscribeTrades,
         },
     },
@@ -580,6 +580,68 @@ impl DataClient for DatabentoDataClient {
 
         let subscription = Subscription::builder()
             .schema(databento::dbn::Schema::Trades)
+            .symbols(symbol)
+            .build();
+
+        self.send_command_to_dataset(&dataset, HandlerCommand::Subscribe(subscription))?;
+
+        Ok(())
+    }
+
+    /// Subscribes to bar data for the specified instruments by mapping the bar
+    /// specification to the corresponding Databento OHLCV schema.
+    ///
+    /// Handles `External`-aggregation bar types (the venue/adapter supplies the
+    /// bars); internally-aggregated bars are built by the data engine and never
+    /// reach this client. The matching `OhlcvMsg -> Bar` decode is already wired
+    /// in the live feed handler (`handle_record` + `bars_timestamp_on_close`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails, or if the bar
+    /// aggregation is not a Databento-supported OHLCV schema (step-1 Second /
+    /// Minute / Hour / Day).
+    fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
+        log::debug!("Subscribe bars: {cmd:?}");
+
+        let instrument_id = cmd.bar_type.instrument_id();
+        let spec = cmd.bar_type.spec();
+        let schema = match (spec.step.get(), spec.aggregation) {
+            (1, BarAggregation::Second) => databento::dbn::Schema::Ohlcv1S,
+            (1, BarAggregation::Minute) => databento::dbn::Schema::Ohlcv1M,
+            (1, BarAggregation::Hour) => databento::dbn::Schema::Ohlcv1H,
+            (1, BarAggregation::Day) => databento::dbn::Schema::Ohlcv1D,
+            _ => anyhow::bail!(
+                "Databento live bars support only step-1 Second/Minute/Hour/Day OHLCV schemas, got {:?}",
+                cmd.bar_type
+            ),
+        };
+
+        let dataset = self.get_dataset_for_venue(instrument_id.venue)?;
+        let was_new_handler = {
+            let channels = self.cmd_channels.lock().expect(MUTEX_POISONED);
+            !channels.contains_key(&dataset)
+        };
+
+        self.get_or_create_feed_handler(&dataset);
+
+        // Start the feed handler if it was newly created
+        if was_new_handler {
+            self.send_command_to_dataset(&dataset, HandlerCommand::Start)?;
+        }
+
+        self.symbol_venue_map
+            .insert(instrument_id.symbol, instrument_id.venue);
+        let symbol = instrument_id.symbol.to_string();
+        if let Some(price_precision) = price_precision_from_params(cmd.params.as_ref())? {
+            self.send_command_to_dataset(
+                &dataset,
+                HandlerCommand::SetPricePrecision(instrument_id.symbol, price_precision),
+            )?;
+        }
+
+        let subscription = Subscription::builder()
+            .schema(schema)
             .symbols(symbol)
             .build();
 
